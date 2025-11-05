@@ -1,4 +1,9 @@
+from contextlib import contextmanager
 import copy
+import datetime
+from dataclasses import dataclass, field
+import heapq
+import logging
 import os
 import socket
 import sys
@@ -7,7 +12,7 @@ import time
 import weakref
 from abc import abstractmethod
 from itertools import chain
-from queue import Empty, Full, LifoQueue
+from queue import Empty, Full, LifoQueue, Queue
 from typing import (
     Any,
     Callable,
@@ -16,6 +21,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -75,6 +81,8 @@ else:
 
 if HIREDIS_AVAILABLE:
     import hiredis
+
+logger = logging.getLogger(__name__)
 
 SYM_STAR = b"*"
 SYM_DOLLAR = b"$"
@@ -162,6 +170,10 @@ class PythonRespSerializer:
 
 
 class ConnectionInterface:
+    pid: int
+    retry: Retry
+    maintenance_notification_hash: int | None
+
     @abstractmethod
     def repr_pieces(self):
         pass
@@ -1681,6 +1693,202 @@ def parse_url(url):
 _CP = TypeVar("_CP", bound="ConnectionPool")
 
 
+@dataclass(order=True)
+class _PoolMetadata:
+    """Metadata for a registered pool, used both for tracking and scheduling."""
+
+    next_check_time: (
+        float  # timestamp when this pool should be checked next (for heapq ordering)
+    )
+    pool_id: int = field(compare=False)  # id(pool) for identification
+    pool_ref: weakref.ref = field(compare=False)
+    idle_timeout: float = field(compare=False)
+    check_interval: float = field(compare=False)  # minimum time between checks
+
+
+class IdleConnectionCleanupManager:
+    """Global singleton manager for idle connection cleanup across all pools.
+
+    This manager maintains a single worker thread that handles cleanup for all
+    connection pools, using a priority queue to efficiently schedule checks.
+    """
+
+    _instance: Optional["IdleConnectionCleanupManager"] = None
+    _instance_lock = threading.Lock()
+
+    def __init__(self):
+        # callers should use get_instance() instead of directly calling the constructor
+        self._schedule_lock = threading.RLock()
+        self._condition = threading.Condition(self._schedule_lock)
+        self._schedule: List[_PoolMetadata] = []  # heapq-based priority queue
+        self._registered_pools: set[int] = set()  # set of pool ids in the _schedule
+        self._worker_thread: Optional[threading.Thread] = None
+        self._shutdown_event = threading.Event()
+        # WAL-style tracking: if we pop a pool from schedule but crash before re-adding,
+        # we can recover it from here
+        self._pool_being_cleaned: Optional[_PoolMetadata] = None
+
+    @classmethod
+    def get_instance(cls) -> "IdleConnectionCleanupManager":
+        # get or create the singleton instance
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = IdleConnectionCleanupManager()
+                    cls._instance._start_worker()
+        return cls._instance
+
+    def _start_worker(self) -> None:
+        """Start the background worker thread."""
+        self._shutdown_event.clear()
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, daemon=True, name="IdleConnectionCleanupManager"
+        )
+        self._worker_thread.start()
+
+    def register_pool(self, pool: "ConnectionPool", next_check_time: float) -> None:
+        # Register a pool for idle connection cleanup.
+        # Called when a connection is released.
+
+        if pool.idle_connection_timeout is None:
+            # no need to register, because this pool doesn't close idle connections
+            return
+
+        pool_id = id(pool)
+
+        with self._condition:
+            if pool_id in self._registered_pools:
+                # no-op if already registered
+                return
+
+            metadata = _PoolMetadata(
+                next_check_time=next_check_time,
+                pool_id=pool_id,
+                pool_ref=weakref.ref(pool),
+                idle_timeout=pool.idle_connection_timeout,
+                check_interval=pool.idle_check_interval,
+            )
+
+            self._registered_pools.add(pool_id)
+            heapq.heappush(self._schedule, metadata)
+
+            # wake up worker to potentially adjust sleep time
+            self._condition.notify()
+
+    def unregister_pool(self, pool: "ConnectionPool") -> None:
+        # Unregister a pool from cleanup
+        pool_id = id(pool)
+        with self._condition:
+            self._registered_pools.discard(pool_id)
+            # Note: We don't remove from schedule immediately, because the heapq
+            # doesn't have a fast way to do this. The worker will skip it when it
+            # processes the entry.
+
+    def _worker_loop(self) -> None:
+        # processes pools in schedule order
+        while not self._shutdown_event.is_set():
+            try:
+                with self._condition:
+                    # first, check if we have a pool from a previous failed iteration
+                    if self._pool_being_cleaned is not None:
+                        # re-add it to schedule before processing anything else
+                        heapq.heappush(self._schedule, self._pool_being_cleaned)
+                        self._pool_being_cleaned = None
+
+                    # get the next pool to be processed
+                    next_pair = self._get_next_pool()
+                    if next_pair is None:
+                        continue
+                    metadata, pool = next_pair
+
+                    # use a WAL pattern to be defensive against bugs resulting
+                    # in us dequeueing a pool, and never re-enqueueing it.
+                    self._pool_being_cleaned = metadata
+
+                # release lock while doing cleanup, since this is relatively slow
+                try:
+                    oldest_conn_time = pool._cleanup_idle_connections()
+                except Exception as e:
+                    logger.warning(
+                        "Error during idle connection cleanup for pool %s: %s",
+                        id(pool),
+                        e,
+                        exc_info=True,
+                    )
+                    oldest_conn_time = None
+                finally:
+                    # make sure to drop the pool reference - we never want the idle connection
+                    # thread to be the only thing holding a reference to a pool, because this can
+                    # keep the pool from being GC'd, and closing all of its connections.
+                    del pool
+
+                with self._condition:
+                    self._reschedule_pool(metadata, oldest_conn_time)
+                    # the pool after the pool is rescheduled, we can clean up the WAL
+                    self._pool_being_cleaned = None
+            except Exception as e:
+                logger.error(
+                    "Unexpected error in idle connection cleanup worker: %s",
+                    e,
+                    exc_info=True,
+                )
+
+    def _get_next_pool(self) -> "Tuple[_PoolMetadata, ConnectionPool] | None":
+        if not self._schedule:
+            # No pools to manage, wait for registration or shutdown
+            self._condition.wait()
+            return None
+
+        # Peek at next pool to check
+        metadata = self._schedule[0]
+
+        wait_time = metadata.next_check_time - time.time()
+        if wait_time > 0:
+            # Sleep until next scheduled check (or until notified)
+            self._condition.wait(timeout=wait_time)
+            return
+
+        heapq.heappop(self._schedule)
+
+        if metadata.pool_id not in self._registered_pools:
+            # pool was unregistered
+            return None
+
+        pool = metadata.pool_ref()
+        if pool is None:
+            # pool was GC'd
+            self._registered_pools.discard(metadata.pool_id)
+            return None
+
+        return metadata, pool
+
+    def _reschedule_pool(self, metadata: _PoolMetadata, oldest_conn_time: float | None):
+        if metadata.pool_id not in self._registered_pools:
+            # pool was unregistered while we were cleaning it
+            return
+
+        # reschedule this pool, or remove if empty
+        if oldest_conn_time:
+            next_check = max(
+                # check when the oldest connection will become idle
+                oldest_conn_time + metadata.idle_timeout,
+                # ...but don't check more frequently than check_interval
+                time.time() + metadata.check_interval,
+            )
+            # Pool has connections, reschedule it
+            metadata.next_check_time = next_check
+            heapq.heappush(self._schedule, metadata)
+        else:
+            # Pool is empty, remove from tracking entirely
+            self._registered_pools.discard(metadata.pool_id)
+
+
+class PooledConnection:
+    def __init__(self, connection: ConnectionInterface):
+        self.connection = connection
+        self.last_used: datetime.datetime = datetime.datetime.now()
+
+
 class ConnectionPool:
     """
     Create a connection pool. ``If max_connections`` is set, then this
@@ -1750,17 +1958,31 @@ class ConnectionPool:
         connection_class=Connection,
         max_connections: Optional[int] = None,
         cache_factory: Optional[CacheFactoryInterface] = None,
+        idle_connection_timeout: Optional[float] = None,
+        idle_check_interval: float = 60.0,
         **connection_kwargs,
     ):
         max_connections = max_connections or 2**31
         if not isinstance(max_connections, int) or max_connections < 0:
             raise ValueError('"max_connections" must be a positive integer')
 
+        if idle_connection_timeout is not None and idle_connection_timeout <= 0:
+            raise ValueError(
+                '"idle_connection_timeout" must be a positive number or None'
+            )
+
+        if idle_check_interval <= 0:
+            raise ValueError('"idle_check_interval" must be a positive number')
+
         self.connection_class = connection_class
         self.connection_kwargs = connection_kwargs
         self.max_connections = max_connections
         self.cache = None
         self._cache_factory = cache_factory
+        self._available_connections: list[PooledConnection] = []
+        self._in_use_connections: set[ConnectionInterface] = set()
+        self.idle_connection_timeout = idle_connection_timeout
+        self.idle_check_interval = idle_check_interval
 
         if connection_kwargs.get("cache_config") or connection_kwargs.get("cache"):
             if self.connection_kwargs.get("protocol") not in [3, "3"]:
@@ -1865,11 +2087,11 @@ class ConnectionPool:
     ):
         """Update the maintenance notifications config for all connections in the pool."""
         with self._lock:
-            for conn in self._available_connections:
-                conn.set_maint_notifications_pool_handler(
+            for pooled_conn in self._available_connections:
+                pooled_conn.connection.set_maint_notifications_pool_handler(
                     maint_notifications_pool_handler
                 )
-                conn.maint_notifications_config = (
+                pooled_conn.connection.maint_notifications_config = (
                     maint_notifications_pool_handler.config
                 )
             for conn in self._in_use_connections:
@@ -1912,6 +2134,50 @@ class ConnectionPool:
         # _fork_lock, they will notice that another thread already called
         # reset() and they will immediately release _fork_lock and continue on.
         self.pid = os.getpid()
+
+    def _cleanup_idle_connections(self) -> Optional[float]:
+        """Remove connections that have been idle for longer than the timeout.
+
+        Returns:
+            Timestamp of the oldest remaining connection, or None if pool is empty.
+        """
+        if self.idle_connection_timeout is None:
+            return None
+
+        now = datetime.datetime.now()
+        connections_to_disconnect = []
+        oldest_connection_time = None
+
+        with self._lock:
+            connections_to_keep = []
+            for pooled_conn in self._available_connections:
+                idle_time = (now - pooled_conn.last_used).total_seconds()
+                if idle_time < self.idle_connection_timeout:
+                    connections_to_keep.append(pooled_conn)
+                    # Track the oldest connection we're keeping
+                    conn_timestamp = pooled_conn.last_used.timestamp()
+                    if (
+                        oldest_connection_time is None
+                        or conn_timestamp < oldest_connection_time
+                    ):
+                        oldest_connection_time = conn_timestamp
+                else:
+                    # Mark for disconnection
+                    connections_to_disconnect.append(pooled_conn)
+                    self._created_connections -= 1
+
+            self._available_connections = connections_to_keep
+
+        # Disconnect outside the lock to avoid blocking pool operations
+        for pooled_conn in connections_to_disconnect:
+            try:
+                pooled_conn.connection.disconnect()
+            except Exception as e:
+                logger.warning(
+                    "Error disconnecting idle connection: %s", e, exc_info=True
+                )
+
+        return oldest_connection_time
 
     def _checkpid(self) -> None:
         # _checkpid() attempts to keep ConnectionPool fork-safe on modern
@@ -1965,13 +2231,15 @@ class ConnectionPool:
         reason="Use get_connection() without args instead",
         version="5.3.0",
     )
-    def get_connection(self, command_name=None, *keys, **options) -> "Connection":
+    def get_connection(
+        self, command_name=None, *keys, **options
+    ) -> "ConnectionInterface":
         "Get a connection from the pool"
 
         self._checkpid()
         with self._lock:
             try:
-                connection = self._available_connections.pop()
+                connection = self._available_connections.pop().connection
             except IndexError:
                 connection = self.make_connection()
             self._in_use_connections.add(connection)
@@ -2025,9 +2293,10 @@ class ConnectionPool:
             )
         return self.connection_class(**kwargs)
 
-    def release(self, connection: "Connection") -> None:
+    def release(self, connection: "ConnectionInterface") -> None:
         "Releases the connection back to the pool"
         self._checkpid()
+        release_time = time.time()
         with self._lock:
             try:
                 self._in_use_connections.remove(connection)
@@ -2039,7 +2308,7 @@ class ConnectionPool:
             if self.owns_connection(connection):
                 if connection.should_reconnect():
                     connection.disconnect()
-                self._available_connections.append(connection)
+                self._available_connections.append(PooledConnection(connection))
                 self._event_dispatcher.dispatch(
                     AfterConnectionReleasedEvent(connection)
                 )
@@ -2051,7 +2320,12 @@ class ConnectionPool:
                 connection.disconnect()
                 return
 
-    def owns_connection(self, connection: "Connection") -> int:
+        # Register with manager if pool was empty (will be a no-op if already registered)
+        if self.idle_connection_timeout is not None:
+            next_check = release_time + self.idle_connection_timeout
+            IdleConnectionCleanupManager.get_instance().register_pool(self, next_check)
+
+    def owns_connection(self, connection: "ConnectionInterface") -> int:
         return connection.pid == self.pid
 
     def disconnect(self, inuse_connections: bool = True) -> None:
@@ -2064,37 +2338,36 @@ class ConnectionPool:
         """
         self._checkpid()
         with self._lock:
+            connections = (p.connection for p in self._available_connections)
             if inuse_connections:
-                connections = chain(
-                    self._available_connections, self._in_use_connections
-                )
-            else:
-                connections = self._available_connections
+                connections = chain(connections, self._in_use_connections)
 
             for connection in connections:
                 connection.disconnect()
 
     def close(self) -> None:
         """Close the pool, disconnecting all connections"""
+        if self.idle_connection_timeout is not None:
+            IdleConnectionCleanupManager.get_instance().unregister_pool(self)
         self.disconnect()
 
     def set_retry(self, retry: Retry) -> None:
         self.connection_kwargs.update({"retry": retry})
-        for conn in self._available_connections:
-            conn.retry = retry
+        for pooled_conn in self._available_connections:
+            pooled_conn.connection.retry = retry
         for conn in self._in_use_connections:
             conn.retry = retry
 
     def re_auth_callback(self, token: TokenInterface):
         with self._lock:
-            for conn in self._available_connections:
-                conn.retry.call_with_retry(
+            for pooled_conn in self._available_connections:
+                pooled_conn.connection.retry.call_with_retry(
                     lambda: conn.send_command(
                         "AUTH", token.try_get("oid"), token.get_value()
                     ),
                     lambda error: self._mock(error),
                 )
-                conn.retry.call_with_retry(
+                pooled_conn.connection.retry.call_with_retry(
                     lambda: conn.read_response(), lambda error: self._mock(error)
                 )
             for conn in self._in_use_connections:
@@ -2102,7 +2375,7 @@ class ConnectionPool:
 
     def _should_update_connection(
         self,
-        conn: "Connection",
+        conn: "ConnectionInterface",
         matching_pattern: Literal[
             "connected_address", "configured_address", "notification_hash"
         ] = "connected_address",
@@ -2128,7 +2401,7 @@ class ConnectionPool:
 
     def update_connection_settings(
         self,
-        conn: "Connection",
+        conn: "ConnectionInterface",
         state: Optional["MaintenanceState"] = None,
         maintenance_notification_hash: Optional[int] = None,
         host_address: Optional[str] = None,
@@ -2216,15 +2489,15 @@ class ConnectionPool:
                     )
 
             if include_free_connections:
-                for conn in self._available_connections:
+                for pooled_conn in self._available_connections:
                     if self._should_update_connection(
-                        conn,
+                        pooled_conn.connection,
                         matching_pattern,
                         matching_address,
                         matching_notification_hash,
                     ):
                         self.update_connection_settings(
-                            conn,
+                            pooled_conn.connection,
                             state=state,
                             maintenance_notification_hash=maintenance_notification_hash,
                             host_address=host_address,
@@ -2274,11 +2547,11 @@ class ConnectionPool:
         :param moving_address_src: The address of the node that is being moved.
         """
         with self._lock:
-            for conn in self._available_connections:
+            for pooled_conn in self._available_connections:
                 if self._should_update_connection(
-                    conn, "connected_address", moving_address_src
+                    pooled_conn.connection, "connected_address", moving_address_src
                 ):
-                    conn.disconnect()
+                    pooled_conn.connection.disconnect()
 
     async def _mock(self, error: RedisError):
         """
@@ -2329,24 +2602,26 @@ class BlockingConnectionPool(ConnectionPool):
         timeout=20,
         connection_class=Connection,
         queue_class=LifoQueue,
+        idle_connection_timeout: Optional[float] = None,
+        idle_check_interval: float = 60.0,
         **connection_kwargs,
     ):
         self.queue_class = queue_class
         self.timeout = timeout
         self._in_maintenance = False
         self._locked = False
+        self.pool: Queue[PooledConnection | None] = self.queue_class(max_connections)
         super().__init__(
             connection_class=connection_class,
             max_connections=max_connections,
+            idle_connection_timeout=idle_connection_timeout,
+            idle_check_interval=idle_check_interval,
             **connection_kwargs,
         )
 
     def reset(self):
         # Create and fill up a thread safe queue with ``None`` values.
-        try:
-            if self._in_maintenance:
-                self._lock.acquire()
-                self._locked = True
+        with self._maintenance_lock():
             self.pool = self.queue_class(self.max_connections)
             while True:
                 try:
@@ -2357,13 +2632,6 @@ class BlockingConnectionPool(ConnectionPool):
             # Keep a list of actual connection instances so that we can
             # disconnect them later.
             self._connections = []
-        finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
 
         # this must be the last operation in this method. while reset() is
         # called when holding _fork_lock, other threads in this process
@@ -2378,11 +2646,7 @@ class BlockingConnectionPool(ConnectionPool):
 
     def make_connection(self):
         "Make a fresh connection."
-        try:
-            if self._in_maintenance:
-                self._lock.acquire()
-                self._locked = True
-
+        with self._maintenance_lock():
             if self.cache is not None:
                 connection = CacheProxyConnection(
                     self.connection_class(**self.connection_kwargs),
@@ -2393,13 +2657,6 @@ class BlockingConnectionPool(ConnectionPool):
                 connection = self.connection_class(**self.connection_kwargs)
                 self._connections.append(connection)
             return connection
-        finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
 
     @deprecated_args(
         args_to_warn=["*"],
@@ -2424,28 +2681,20 @@ class BlockingConnectionPool(ConnectionPool):
         # Try and get a connection from the pool. If one isn't available within
         # self.timeout then raise a ``ConnectionError``.
         connection = None
-        try:
-            if self._in_maintenance:
-                self._lock.acquire()
-                self._locked = True
+        with self._maintenance_lock():
             try:
-                connection = self.pool.get(block=True, timeout=self.timeout)
+                pooled_connection = self.pool.get(block=True, timeout=self.timeout)
             except Empty:
                 # Note that this is not caught by the redis client and will be
                 # raised unless handled by application code. If you want never to
                 raise ConnectionError("No connection available.")
 
-            # If the ``connection`` is actually ``None`` then that's a cue to make
+            # If the ``pooled_connection`` is actually ``None`` then that's a cue to make
             # a new connection to add to the pool.
-            if connection is None:
+            if pooled_connection:
+                connection = pooled_connection.connection
+            else:
                 connection = self.make_connection()
-        finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
 
         try:
             # ensure this connection is connected to Redis
@@ -2474,10 +2723,8 @@ class BlockingConnectionPool(ConnectionPool):
         # Make sure we haven't changed process.
         self._checkpid()
 
-        try:
-            if self._in_maintenance:
-                self._lock.acquire()
-                self._locked = True
+        release_time = time.time()
+        with self._maintenance_lock():
             if not self.owns_connection(connection):
                 # pool doesn't own this connection. do not add it back
                 # to the pool. instead add a None value which is a placeholder
@@ -2490,35 +2737,86 @@ class BlockingConnectionPool(ConnectionPool):
                 connection.disconnect()
             # Put the connection back into the pool.
             try:
-                self.pool.put_nowait(connection)
+                self.pool.put_nowait(PooledConnection(connection))
             except Full:
                 # perhaps the pool has been reset() after a fork? regardless,
                 # we don't want this connection
                 pass
-        finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
+
+        # Register with manager if pool was empty (will be a no-op if already registered)
+        if self.idle_connection_timeout is not None:
+            next_check = release_time + self.idle_connection_timeout
+            IdleConnectionCleanupManager.get_instance().register_pool(self, next_check)
 
     def disconnect(self):
         "Disconnects all connections in the pool."
         self._checkpid()
-        try:
-            if self._in_maintenance:
-                self._lock.acquire()
-                self._locked = True
+        with self._maintenance_lock():
             for connection in self._connections:
                 connection.disconnect()
-        finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
+
+    def _cleanup_idle_connections(self) -> Optional[float]:
+        """Remove connections that have been idle for longer than the timeout.
+
+        Override for BlockingConnectionPool to work with Queue structure.
+
+        Returns:
+            Timestamp of the oldest remaining connection, or None if pool is empty.
+        """
+
+        if self.idle_connection_timeout is None:
+            return None
+
+        now = datetime.datetime.now()
+        connections_to_disconnect = []
+        oldest_connection_time = None
+
+        with self._maintenance_lock():
+            # Access the internal deque directly while holding the queue's mutex
+            # Note: it's safe to manipulate pool.queue while holding the lock,
+            # but ONLY because we're not adding / removing elements. If we were,
+            # we'd need to update pool.not_empty, pool.not_full, etc. as well,
+            # to keep all the state in sync.
+            with self.pool.mutex:
+                # Iterate through the internal deque in-place
+                for i, item in enumerate(self.pool.queue):
+                    # Check if this is an idle connection that should be cleaned up
+                    if item is None:
+                        continue
+                    idle_time = (now - item.last_used).total_seconds()
+                    if idle_time >= self.idle_connection_timeout:
+                        # Mark for disconnection and replace with None placeholder
+                        connections_to_disconnect.append(item)
+                        self.pool.queue[i] = None
+                        # Remove from _connections tracking list
+                        try:
+                            self._connections.remove(item.connection)
+                        except ValueError as e:
+                            logger.debug(
+                                "Connection not found in _connections list during cleanup: %s",
+                                e,
+                            )
+                    else:
+                        # Track the oldest connection we're keeping
+                        conn_timestamp = item.last_used.timestamp()
+                        if (
+                            oldest_connection_time is None
+                            or conn_timestamp < oldest_connection_time
+                        ):
+                            oldest_connection_time = conn_timestamp
+
+        # Disconnect outside all locks to avoid blocking pool operations
+        for pooled_conn in connections_to_disconnect:
+            try:
+                pooled_conn.connection.disconnect()
+            except Exception as e:
+                logger.warning(
+                    "Error disconnecting idle connection in BlockingConnectionPool: %s",
+                    e,
+                    exc_info=True,
+                )
+
+        return oldest_connection_time
 
     def update_connections_settings(
         self,
@@ -2559,7 +2857,11 @@ class BlockingConnectionPool(ConnectionPool):
                             reset_relaxed_timeout=reset_relaxed_timeout,
                         )
             else:
-                connections_in_queue = {conn for conn in self.pool.queue if conn}
+                connections_in_queue = {
+                    pooled_conn.connection
+                    for pooled_conn in self.pool.queue
+                    if pooled_conn
+                }
                 for conn in self._connections:
                     if conn not in connections_in_queue:
                         if self._should_update_connection(
@@ -2590,7 +2892,9 @@ class BlockingConnectionPool(ConnectionPool):
         :param moving_address_src: The address of the node that is being moved.
         """
         with self._lock:
-            connections_in_queue = {conn for conn in self.pool.queue if conn}
+            connections_in_queue = {
+                pooled_conn.connection for pooled_conn in self.pool.queue if pooled_conn
+            }
             for conn in self._connections:
                 if conn not in connections_in_queue:
                     if self._should_update_connection(
@@ -2613,12 +2917,12 @@ class BlockingConnectionPool(ConnectionPool):
         with self._lock:
             existing_connections = self.pool.queue
 
-            for conn in existing_connections:
-                if conn:
+            for pooled_conn in existing_connections:
+                if pooled_conn:
                     if self._should_update_connection(
-                        conn, "connected_address", moving_address_src
+                        pooled_conn.connection, "connected_address", moving_address_src
                     ):
-                        conn.disconnect()
+                        pooled_conn.connection.disconnect()
 
     def _update_maint_notifications_config_for_connections(
         self, maint_notifications_config
@@ -2647,3 +2951,18 @@ class BlockingConnectionPool(ConnectionPool):
         The pool will be in maintenance mode only when we are processing a MOVING notification.
         """
         self._in_maintenance = in_maintenance
+
+    @contextmanager
+    def _maintenance_lock(self):
+        try:
+            if self._in_maintenance:
+                self._lock.acquire()
+                self._locked = True
+            yield
+        finally:
+            if self._locked:
+                try:
+                    self._lock.release()
+                except Exception:
+                    pass
+                self._locked = False
